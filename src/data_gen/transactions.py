@@ -3,24 +3,48 @@ import numpy as np
 from datetime import datetime, timedelta
 import random
 
+# src/data_gen/transactions.py
+
 def make_normal_transaction(user, merchants, timestamp):
     """
     Generates one legitimate transaction for `user` at `timestamp`.
-    Picks a merchant from the user's preferred categories,
-    a location close to the user's home, and an amount near
-    their historical average.
+    Picks a merchant from the user's preferred categories, a location
+    usually close to home (occasionally traveling), and an amount usually
+    near their historical average (occasionally small, e.g. coffee/parking).
+
+    Includes small-amount and travel overlap with fraud typologies so
+    legitimate behavior isn't perfectly separable from fraud on amount
+    or location alone.
     """
     # 1. Pick a merchant matching the user's typical spending categories
     candidate_merchants = [m for m in merchants if m["category"] in user["preferred_categories"]]
     merchant = random.choice(candidate_merchants)
 
-    # 2. Amount: normal variation around the user's average, never negative
-    amount = max(1.0, np.random.normal(loc=user["avg_txn_amount"], scale=user["avg_txn_amount"] * 0.3))
+    # 2. Amount: usually near the user's average, but ~8% of the time a
+    #    small purchase (coffee, snacks, parking) — overlaps with the
+    #    card-testing amount range ($0.50-$3) on purpose
+    if random.random() < 0.08:
+        amount = round(np.random.uniform(1.0, 8.0), 2)
+    else:
+        amount = max(1.0, np.random.normal(loc=user["avg_txn_amount"], scale=user["avg_txn_amount"] * 0.3))
 
-    # 3. Location: small jitter around home (a few km), NOT the merchant's actual location —
-    #    this is a simplification; card-present location ≈ user's current location
-    lat = float(user["home_lat"]) + np.random.normal(0, 0.05)
-    lon = float(user["home_lon"]) + np.random.normal(0, 0.05)
+    # 3. Location: usually small jitter around home, but ~2% of the time
+    #    a legitimate travel transaction (business trip, vacation) —
+    #    overlaps with account-takeover's geo-distance signal on purpose
+    if random.random() < 0.02:
+        distance = np.random.uniform(3, 15)
+        lat = float(user["home_lat"]) + random.choice([-1, 1]) * distance
+        lon = float(user["home_lon"]) + random.choice([-1, 1]) * distance
+    else:
+        lat = float(user["home_lat"]) + np.random.normal(0, 0.05)
+        lon = float(user["home_lon"]) + np.random.normal(0, 0.05)
+
+    # 4. Device: usually the user's known device, but ~5% of the time a
+    #    new/secondary device (new phone, family member's card)
+    if random.random() < 0.05:
+        device_id = f"D_UNKNOWN_{random.randint(1000,9999)}"
+    else:
+        device_id = f"D_{user['user_id']}_primary"
 
     return {
         "user_id": user["user_id"],
@@ -29,11 +53,10 @@ def make_normal_transaction(user, merchants, timestamp):
         "timestamp": timestamp,
         "lat": lat,
         "lon": lon,
-        "device_id": f"D_{user['user_id']}_primary",  # user's usual device
+        "device_id": device_id,
         "is_fraud": 0,
         "fraud_type": None,
     }
-
 
 #generating a time sequence of transactions for a user
 
@@ -60,5 +83,6 @@ def generate_normal_stream(user, merchants, start_date, days=90, avg_txns_per_da
 
             txn = make_normal_transaction(user, merchants, txn_time) #One thing to note: this function calls make_normal_transaction in a loop, and for ~5000 users × 90 days that's already tens of thousands of transactions
             transactions.append(txn)
+    
 
     return transactions

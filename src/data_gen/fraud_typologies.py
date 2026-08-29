@@ -3,6 +3,21 @@ import numpy as np
 import random
 from datetime import timedelta
 
+
+def _sample_device(user):
+    """
+    Shared helper: ~12% of fraud transactions occur on the user's known
+    device (session hijack, stolen physical card before the owner
+    notices) rather than always showing an unknown device. This keeps
+    is_known_device a strong but imperfect signal, forcing the model
+    to combine it with velocity/geo/amount features rather than
+    shortcut on it alone.
+    """
+    if random.random() < 0.12:
+        return f"D_{user['user_id']}_primary"
+    return f"D_UNKNOWN_{random.randint(1000, 9999)}"
+
+
 def inject_card_testing(user, merchants, start_time, n_probes=None):
     """
     Simulates a card-testing attack: a burst of tiny transactions
@@ -31,7 +46,7 @@ def inject_card_testing(user, merchants, start_time, n_probes=None):
             "timestamp": current_time,
             "lat": float(user["home_lat"]) + np.random.normal(0, 0.05),
             "lon": float(user["home_lon"]) + np.random.normal(0, 0.05),
-            "device_id": f"D_UNKNOWN_{random.randint(1000,9999)}",  # attacker's device, not the user's
+            "device_id": _sample_device(user),
             "is_fraud": 1,
             "fraud_type": "card_testing",
         })
@@ -42,17 +57,24 @@ def inject_card_testing(user, merchants, start_time, n_probes=None):
 
     return transactions
 
+
 def inject_account_takeover(user, merchants, timestamp):
     """
-    One large, geographically distant transaction, on an unknown
-    device — no burst, just a single high-value hit.
+    One large transaction, usually geographically distant, on an
+    unrecognized device — but with realistic noise: some ATO happens
+    closer to home (attacker in the same region), and some occurs on
+    a known device (session hijack, stolen physical card).
     """
     merchant = random.choice(merchants)  # NOT filtered by user's preferred category —
                                           # attacker doesn't know/care about user's habits
 
-    # Jump far from home — degrees roughly translate to hundreds of km
-    lat = float(user["home_lat"]) + random.choice([-1, 1]) * np.random.uniform(5, 30)
-    lon = float(user["home_lon"]) + random.choice([-1, 1]) * np.random.uniform(5, 30)
+    # Distance: usually a big jump, but sometimes closer (same-region attacker) —
+    # 30% chance of a smaller 1-5 degree jump, 70% chance of the original 5-30 range
+    distance_degrees = np.random.choice(
+        [np.random.uniform(1, 5), np.random.uniform(5, 30)], p=[0.3, 0.7]
+    )
+    lat = float(user["home_lat"]) + random.choice([-1, 1]) * distance_degrees
+    lon = float(user["home_lon"]) + random.choice([-1, 1]) * distance_degrees
 
     # Go big: several multiples of the user's normal average
     amount = round(user["avg_txn_amount"] * np.random.uniform(4, 10), 2)
@@ -64,10 +86,11 @@ def inject_account_takeover(user, merchants, timestamp):
         "timestamp": timestamp,
         "lat": lat,
         "lon": lon,
-        "device_id": f"D_UNKNOWN_{random.randint(1000,9999)}",
+        "device_id": _sample_device(user),
         "is_fraud": 1,
         "fraud_type": "account_takeover",
     }
+
 
 def inject_velocity_abuse(user, merchants, start_time, n_txns=None):
     """
@@ -96,12 +119,13 @@ def inject_velocity_abuse(user, merchants, start_time, n_txns=None):
             "timestamp": current_time,
             "lat": float(user["home_lat"]) + np.random.normal(0, 0.1),  # slightly wider than normal jitter
             "lon": float(user["home_lon"]) + np.random.normal(0, 0.1),
-            "device_id": f"D_UNKNOWN_{random.randint(1000,9999)}",
+            "device_id": _sample_device(user),
             "is_fraud": 1,
             "fraud_type": "velocity_abuse",
         })
         # Faster than normal user behavior, but slower than card-testing probes —
-        # a distinct pace signature
+        # a distinct pace signature; overlaps with the normal shopping-trip
+        # burst's 5-25 min gaps on purpose, so velocity alone isn't a perfect tell
         current_time += timedelta(minutes=random.randint(2, 20))
 
     return transactions
