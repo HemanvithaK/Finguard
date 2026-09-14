@@ -5,9 +5,10 @@ from torch.utils.data import Dataset
 
 SEQ_FEATURES = [
     "amount", "time_since_prev_txn", "dist_from_home_km",
-    "amount_vs_avg_ratio", "is_known_device", "hour_of_day"
+    "amount_vs_avg_ratio", "is_known_device", "hour_of_day",
+    "txns_last_10min", "distinct_merchants_1hr"  # added back based on error analysis
 ]
-MAX_SEQ_LEN = 10
+MAX_SEQ_LEN = 25
 
 class TransactionSequenceDataset(Dataset):
     def __init__(self, df):

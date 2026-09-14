@@ -9,7 +9,7 @@ class PositionalEncoding(nn.Module):
     positional encoding injects that information by adding a unique,
     deterministic sinusoidal pattern to each position in the sequence.
     """
-    def __init__(self, d_model, max_len=10):
+    def __init__(self, d_model, max_len=50):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len).unsqueeze(1).float()
