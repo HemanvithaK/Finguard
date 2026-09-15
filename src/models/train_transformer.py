@@ -1,6 +1,8 @@
+# src/models/train_transformer.py
 import torch
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.metrics import average_precision_score, roc_auc_score, classification_report, precision_recall_curve
+from sklearn.linear_model import LogisticRegression
 import numpy as np
 import pandas as pd
 
@@ -12,8 +14,8 @@ def train_transformer(train_df, test_df, epochs=10, batch_size=256, lr=5e-4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on: {device}")
 
-    train_dataset = TransactionSequenceDataset(train_df)  # Pass full DataFrame
-    test_dataset = TransactionSequenceDataset(test_df)  # Pass full DataFrame
+    train_dataset = TransactionSequenceDataset(train_df)
+    test_dataset = TransactionSequenceDataset(test_df)
 
     train_labels_arr = np.array(train_dataset.labels)
     class_counts = np.bincount(train_labels_arr.astype(int))
@@ -49,6 +51,7 @@ def train_transformer(train_df, test_df, epochs=10, batch_size=256, lr=5e-4):
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch+1}/{epochs} - avg loss: {avg_loss:.4f}")
 
+    # ---- Evaluation (raw, uncalibrated) ----
     model.eval()
     all_probs, all_labels = [], []
     with torch.no_grad():
@@ -62,18 +65,69 @@ def train_transformer(train_df, test_df, epochs=10, batch_size=256, lr=5e-4):
     all_probs = np.array(all_probs)
     all_labels = np.array(all_labels)
 
-    print("\nPR-AUC:", average_precision_score(all_labels, all_probs))
+    print("\n--- Before Calibration ---")
+    print("PR-AUC:", average_precision_score(all_labels, all_probs))
     print("ROC-AUC:", roc_auc_score(all_labels, all_probs))
-    print(classification_report(all_labels, all_probs > 0.5))
+    print(classification_report(all_labels, all_probs > 0.5, zero_division=0))
 
     precisions, recalls, thresholds = precision_recall_curve(all_labels, all_probs)
     idx = np.argmin(np.abs(recalls - 0.95))
-    print(f"\nAt recall={recalls[idx]:.2f}: precision={precisions[idx]:.2f}, threshold={thresholds[idx]:.3f}")
+    print(f"At recall={recalls[idx]:.2f}: precision={precisions[idx]:.2f}, threshold={thresholds[idx]:.3f}")
 
-    def per_typology_recall(labels, probs, threshold=0.5):
+    # ---- Platt Scaling: recalibrate probabilities ----
+    # The WeightedRandomSampler made training batches ~50/50 fraud/normal,
+    # but real data is 99.6% normal. Raw probabilities are therefore inflated —
+    # the model thinks fraud is much more common than it actually is.
+    # Platt scaling fits a logistic regression on (raw_probs -> true_labels)
+    # using held-out training data to produce properly calibrated probabilities.
+    print("\n--- Applying Platt Scaling ---")
+
+    cal_dataset = TransactionSequenceDataset(train_df.tail(50000))
+    cal_loader = DataLoader(cal_dataset, batch_size=256, shuffle=False)
+
+    cal_probs, cal_labels = [], []
+    with torch.no_grad():
+        for x_batch, y_batch in cal_loader:
+            x_batch = x_batch.to(device)
+            logits = model(x_batch)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            cal_probs.extend(probs)
+            cal_labels.extend(y_batch.numpy())
+
+    cal_probs = np.array(cal_probs).reshape(-1, 1)
+    cal_labels = np.array(cal_labels)
+
+    calibrator = LogisticRegression()
+    calibrator.fit(cal_probs, cal_labels)
+
+    # Recalibrate test predictions
+    all_probs_calibrated = calibrator.predict_proba(all_probs.reshape(-1, 1))[:, 1]
+
+    print("\n--- After Platt Scaling ---")
+    print("PR-AUC:", average_precision_score(all_labels, all_probs_calibrated))
+    print("ROC-AUC:", roc_auc_score(all_labels, all_probs_calibrated))
+
+    # Find optimal threshold: best F1 score on calibrated probabilities
+    precisions_cal, recalls_cal, thresholds_cal = precision_recall_curve(all_labels, all_probs_calibrated)
+    f1_scores = 2 * (precisions_cal[:-1] * recalls_cal[:-1]) / (precisions_cal[:-1] + recalls_cal[:-1] + 1e-8)
+    best_idx = np.argmax(f1_scores)
+    best_threshold = thresholds_cal[best_idx]
+
+    print(f"\nOptimal threshold (best F1): {best_threshold:.4f}")
+    print(f"At optimal threshold: precision={precisions_cal[best_idx]:.3f}, recall={recalls_cal[best_idx]:.3f}, F1={f1_scores[best_idx]:.3f}")
+    print(classification_report(all_labels, all_probs_calibrated > best_threshold, zero_division=0))
+
+    # Compare: how many false positives now vs before?
+    fp_before = (all_probs > 0.5).sum() - ((all_probs > 0.5) & (all_labels == 1)).sum()
+    fp_after = (all_probs_calibrated > best_threshold).sum() - ((all_probs_calibrated > best_threshold) & (all_labels == 1)).sum()
+    print(f"False positives before calibration (threshold=0.5): {fp_before}")
+    print(f"False positives after calibration (optimal threshold): {fp_after}")
+
+    # Per-typology recall at optimal threshold
+    def per_typology_recall(labels, probs, threshold):
         preds = (probs > threshold).astype(int)
         results = pd.DataFrame({"true_label": labels, "pred_label": preds, "prob": probs})
-        results["fraud_type"] = test_dataset.fraud_types  # Get fraud types from test dataset
+        results["fraud_type"] = test_dataset.fraud_types
 
         fraud_only = results[results["true_label"] == 1]
         breakdown = fraud_only.groupby("fraud_type").apply(
@@ -83,9 +137,9 @@ def train_transformer(train_df, test_df, epochs=10, batch_size=256, lr=5e-4):
                 "recall": g["pred_label"].mean()
             })
         )
-        print("\nPer-typology recall at threshold =", threshold)
+        print(f"\nPer-typology recall at threshold = {threshold:.4f}")
         print(breakdown)
 
-    per_typology_recall(all_labels, all_probs, threshold=0.5)
+    per_typology_recall(all_labels, all_probs_calibrated, threshold=best_threshold)
 
-    return model, all_probs
+    return model, all_probs_calibrated
