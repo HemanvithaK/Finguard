@@ -5,7 +5,6 @@ import time
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(PROJECT_ROOT / "src" / "models"))
@@ -19,11 +18,12 @@ from entities import generate_users
 from features import haversine_distance
 from train_baseline import FEATURE_COLS
 from src.api.feature_store import FeatureStore
+from src.api.drift_detector import DriftDetector
 
 app = FastAPI(
     title="FinGuard API",
-    description="Fraud detection and investigation API with real-time feature computation",
-    version="2.0.0",
+    description="Fraud detection and investigation API with real-time features and drift monitoring",
+    version="3.0.0",
 )
 
 # ---- Load model and user profiles once at startup ----
@@ -35,6 +35,13 @@ users_df = pd.DataFrame(users)
 
 # ---- Initialize feature store ----
 feature_store = FeatureStore()
+
+# ---- Initialize drift detector ----
+BASELINE_PATH = PROJECT_ROOT / "data" / "processed" / "drift_baseline.json"
+drift_detector = DriftDetector(
+    feature_names=FEATURE_COLS,
+    baseline_path=str(BASELINE_PATH) if BASELINE_PATH.exists() else None,
+)
 
 
 # ---- Request/response schemas ----
@@ -54,7 +61,7 @@ class PredictionResponse(BaseModel):
     fraud_probability: float
     is_flagged: bool
     latency_ms: float
-    feature_source: str  # "live" or "default" — transparency about feature quality
+    feature_source: str
 
 
 class InvestigationRequest(BaseModel):
@@ -71,7 +78,7 @@ class InvestigationResponse(BaseModel):
     latency_ms: float
 
 
-# ---- Prediction endpoint ----
+# ---- Endpoints ----
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "model_loaded": booster is not None}
@@ -79,11 +86,7 @@ def health_check():
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict_fraud(txn: TransactionRequest):
-    """
-    Real-time fraud scoring with live velocity features from the feature store.
-    After scoring, records the transaction so future predictions for this user
-    have accurate velocity context.
-    """
+    """Real-time fraud scoring with live velocity features and drift monitoring."""
     start = time.time()
 
     user = users_df[users_df["user_id"] == txn.user_id]
@@ -91,7 +94,7 @@ def predict_fraud(txn: TransactionRequest):
         raise HTTPException(status_code=404, detail=f"User {txn.user_id} not found")
     user = user.iloc[0]
 
-    # Compute static features (same as before)
+    # Static features
     dist = haversine_distance(
         txn.lat, txn.lon,
         float(user["home_lat"]), float(user["home_lon"])
@@ -100,7 +103,7 @@ def predict_fraud(txn: TransactionRequest):
     amount_ratio = txn.amount / user["avg_txn_amount"]
     hour = pd.to_datetime(txn.timestamp).hour
 
-    # Compute velocity features from feature store (NOT hardcoded anymore)
+    # Live velocity features from feature store
     velocity = feature_store.get_velocity_features(txn.user_id, txn.timestamp)
     feature_source = "live" if velocity["time_since_prev_txn"] != 999999.0 else "default"
 
@@ -118,8 +121,7 @@ def predict_fraud(txn: TransactionRequest):
     feature_df = pd.DataFrame([features])[FEATURE_COLS]
     prob = float(booster.predict(feature_df)[0])
 
-    # Record this transaction AFTER scoring so it's available for
-    # future velocity computations (but doesn't influence its own score)
+    # Record transaction in feature store for future velocity computation
     feature_store.record_transaction({
         "transaction_id": txn.transaction_id,
         "user_id": txn.user_id,
@@ -128,6 +130,9 @@ def predict_fraud(txn: TransactionRequest):
         "timestamp": txn.timestamp,
         "device_id": txn.device_id,
     })
+
+    # Record features for drift monitoring
+    drift_detector.record(features, prob)
 
     latency = (time.time() - start) * 1000
 
@@ -158,3 +163,13 @@ def investigate_fraud(req: InvestigationRequest):
         confidence=result["confidence"],
         latency_ms=round(latency, 2),
     )
+
+
+@app.get("/drift")
+def check_drift():
+    """
+    Returns current drift status — per-feature PSI scores and
+    prediction distribution stats. Hook into Grafana for continuous
+    monitoring, or call periodically to check for distribution shift.
+    """
+    return drift_detector.check_drift()
