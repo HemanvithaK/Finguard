@@ -16,22 +16,25 @@ import lightgbm as lgb
 import pandas as pd
 import numpy as np
 from entities import generate_users
-from features import engineer_features, haversine_distance
+from features import haversine_distance
 from train_baseline import FEATURE_COLS
+from src.api.feature_store import FeatureStore
 
 app = FastAPI(
     title="FinGuard API",
-    description="Fraud detection and investigation API",
-    version="1.0.0",
+    description="Fraud detection and investigation API with real-time feature computation",
+    version="2.0.0",
 )
 
-# ---- Load model once at startup, not per request ----
+# ---- Load model and user profiles once at startup ----
 MODEL_PATH = PROJECT_ROOT / "data" / "processed" / "lgbm_baseline.txt"
 booster = lgb.Booster(model_file=str(MODEL_PATH))
 
-# Load user profiles once
 users = generate_users(n_users=5000)
 users_df = pd.DataFrame(users)
+
+# ---- Initialize feature store ----
+feature_store = FeatureStore()
 
 
 # ---- Request/response schemas ----
@@ -51,6 +54,7 @@ class PredictionResponse(BaseModel):
     fraud_probability: float
     is_flagged: bool
     latency_ms: float
+    feature_source: str  # "live" or "default" — transparency about feature quality
 
 
 class InvestigationRequest(BaseModel):
@@ -67,59 +71,63 @@ class InvestigationResponse(BaseModel):
     latency_ms: float
 
 
-# ---- Helper: compute features for a single transaction ----
-def compute_single_txn_features(txn: TransactionRequest) -> dict:
-    """
-    Computes the same features LightGBM was trained on, for a single
-    incoming transaction. In production, some of these (like time_since_prev_txn)
-    would come from a streaming feature store; here we compute defaults.
-    """
-    user = users_df[users_df["user_id"] == txn.user_id]
-    if user.empty:
-        raise HTTPException(status_code=404, detail=f"User {txn.user_id} not found")
-
-    user = user.iloc[0]
-
-    dist = haversine_distance(
-        txn.lat, txn.lon,
-        float(user["home_lat"]), float(user["home_lon"])
-    )
-
-    is_known = 1 if txn.device_id == f"D_{txn.user_id}_primary" else 0
-    amount_ratio = txn.amount / user["avg_txn_amount"]
-    hour = pd.to_datetime(txn.timestamp).hour
-
-    features = {
-        "amount": txn.amount,
-        "time_since_prev_txn": 86400.0,  # default: assume ~1 day since last txn
-        "txns_last_10min": 1.0,          # default: just this transaction
-        "dist_from_home_km": float(dist),
-        "amount_vs_avg_ratio": amount_ratio,
-        "is_known_device": is_known,
-        "distinct_merchants_1hr": 1.0,   # default: just this merchant
-        "hour_of_day": hour,
-    }
-    return features
-
-
-# ---- Endpoints ----
+# ---- Prediction endpoint ----
 @app.get("/health")
 def health_check():
-    """Simple health check — used by load balancers and monitoring."""
     return {"status": "healthy", "model_loaded": booster is not None}
 
 
 @app.post("/predict", response_model=PredictionResponse)
 def predict_fraud(txn: TransactionRequest):
     """
-    Real-time fraud scoring: takes a transaction, returns fraud probability.
-    Designed to run on every transaction — must be fast (no LLM calls).
+    Real-time fraud scoring with live velocity features from the feature store.
+    After scoring, records the transaction so future predictions for this user
+    have accurate velocity context.
     """
     start = time.time()
 
-    features = compute_single_txn_features(txn)
+    user = users_df[users_df["user_id"] == txn.user_id]
+    if user.empty:
+        raise HTTPException(status_code=404, detail=f"User {txn.user_id} not found")
+    user = user.iloc[0]
+
+    # Compute static features (same as before)
+    dist = haversine_distance(
+        txn.lat, txn.lon,
+        float(user["home_lat"]), float(user["home_lon"])
+    )
+    is_known = 1 if txn.device_id == f"D_{txn.user_id}_primary" else 0
+    amount_ratio = txn.amount / user["avg_txn_amount"]
+    hour = pd.to_datetime(txn.timestamp).hour
+
+    # Compute velocity features from feature store (NOT hardcoded anymore)
+    velocity = feature_store.get_velocity_features(txn.user_id, txn.timestamp)
+    feature_source = "live" if velocity["time_since_prev_txn"] != 999999.0 else "default"
+
+    features = {
+        "amount": txn.amount,
+        "time_since_prev_txn": velocity["time_since_prev_txn"],
+        "txns_last_10min": velocity["txns_last_10min"],
+        "dist_from_home_km": float(dist),
+        "amount_vs_avg_ratio": amount_ratio,
+        "is_known_device": is_known,
+        "distinct_merchants_1hr": velocity["distinct_merchants_1hr"],
+        "hour_of_day": hour,
+    }
+
     feature_df = pd.DataFrame([features])[FEATURE_COLS]
     prob = float(booster.predict(feature_df)[0])
+
+    # Record this transaction AFTER scoring so it's available for
+    # future velocity computations (but doesn't influence its own score)
+    feature_store.record_transaction({
+        "transaction_id": txn.transaction_id,
+        "user_id": txn.user_id,
+        "merchant_id": txn.merchant_id,
+        "amount": txn.amount,
+        "timestamp": txn.timestamp,
+        "device_id": txn.device_id,
+    })
 
     latency = (time.time() - start) * 1000
 
@@ -128,15 +136,13 @@ def predict_fraud(txn: TransactionRequest):
         fraud_probability=round(prob, 6),
         is_flagged=prob > 0.5,
         latency_ms=round(latency, 2),
+        feature_source=feature_source,
     )
 
 
 @app.post("/investigate", response_model=InvestigationResponse)
 def investigate_fraud(req: InvestigationRequest):
-    """
-    Deep investigation: runs the LangGraph agent on a flagged transaction.
-    Only called for flagged transactions — slower, uses LLM calls.
-    """
+    """Deep investigation via LangGraph agent."""
     start = time.time()
 
     from investigation_agent import investigate_transaction
