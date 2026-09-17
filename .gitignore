@@ -4,3 +4,7 @@ __pycache__/
 data/raw/*.csv
 .env
 .DS_Store
+terraform/terraform.tfvars
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
