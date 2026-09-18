@@ -109,10 +109,15 @@ def main():
     lgbm_probs = eval_lightgbm(test_df)
     results.append(evaluate_model(test_df, lgbm_probs, "LightGBM"))
 
-    # Transformer
-    print("\nEvaluating Transformer...")
-    transformer_probs = eval_transformer(test_df)
-    results.append(evaluate_model(test_df, transformer_probs, "Transformer"))
+    
+
+    try:
+        import torch
+        print("\nEvaluating Transformer...")
+        transformer_probs = eval_transformer(test_df)
+        results.append(evaluate_model(test_df, transformer_probs, "Transformer"))
+    except ImportError:
+        print("\nSkipping Transformer (torch not installed)")
 
     # Summary comparison table
     print(f"\n{'='*60}")
