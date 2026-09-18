@@ -1,0 +1,97 @@
+{
+  "dashboard": {
+    "title": "FinGuard Fraud Detection Dashboard",
+    "description": "Operational monitoring for the FinGuard fraud detection and investigation API",
+    "panels": [
+      {
+        "title": "Prediction Throughput (requests/sec)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "rate(finguard_predictions_total[5m])",
+            "legendFormat": "{{model}} - flagged={{is_flagged}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0}
+      },
+      {
+        "title": "Prediction Latency (p95)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(finguard_prediction_latency_seconds_bucket[5m]))",
+            "legendFormat": "{{model}} p95"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0}
+      },
+      {
+        "title": "Fraud Probability Distribution",
+        "type": "heatmap",
+        "targets": [
+          {
+            "expr": "rate(finguard_fraud_probability_bucket[5m])",
+            "legendFormat": "{{model}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8}
+      },
+      {
+        "title": "Flag Rate by Model (A/B Comparison)",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "rate(finguard_predictions_total{is_flagged='True'}[5m]) / rate(finguard_predictions_total[5m])",
+            "legendFormat": "{{model}}"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8}
+      },
+      {
+        "title": "Investigation Agent Latency (p95)",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(finguard_investigation_latency_seconds_bucket[5m]))"
+          }
+        ],
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16}
+      },
+      {
+        "title": "Investigation Decisions",
+        "type": "piechart",
+        "targets": [
+          {
+            "expr": "finguard_investigation_decisions_total",
+            "legendFormat": "{{decision}} ({{confidence}})"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 6, "x": 6, "y": 16}
+      },
+      {
+        "title": "Feature Drift (PSI)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "finguard_drift_psi",
+            "legendFormat": "{{feature}}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": 0},
+                {"color": "yellow", "value": 0.1},
+                {"color": "red", "value": 0.2}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16}
+      }
+    ],
+    "time": {"from": "now-1h", "to": "now"},
+    "refresh": "10s"
+  }
+}

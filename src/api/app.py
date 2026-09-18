@@ -6,6 +6,12 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from src.api.metrics import (
+    PREDICTIONS_TOTAL, PREDICTION_LATENCY, FRAUD_PROBABILITY,
+    INVESTIGATION_LATENCY, INVESTIGATION_DECISIONS, DRIFT_PSI,
+    ACTIVE_MODEL, metrics_endpoint
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(PROJECT_ROOT / "src" / "models"))
 sys.path.append(str(PROJECT_ROOT / "src" / "data_gen"))
@@ -191,6 +197,12 @@ def predict_fraud(txn: TransactionRequest):
     # Record for A/B comparison
     ab_router.record(model_used, prob, latency, is_flagged)
 
+    # Record Prometheus metrics
+    PREDICTIONS_TOTAL.labels(model=model_used, is_flagged=str(is_flagged)).inc()
+    PREDICTION_LATENCY.labels(model=model_used).observe(latency / 1000)  # convert ms to seconds
+    FRAUD_PROBABILITY.labels(model=model_used).observe(prob)
+    ACTIVE_MODEL.labels(model=model_used).inc()
+
     return PredictionResponse(
         transaction_id=txn.transaction_id,
         fraud_probability=round(prob, 6),
@@ -210,6 +222,9 @@ def investigate_fraud(req: InvestigationRequest):
     result = investigate_transaction(req.transaction_id, req.fraud_probability)
 
     latency = (time.time() - start) * 1000
+
+    INVESTIGATION_LATENCY.observe(latency / 1000)
+    INVESTIGATION_DECISIONS.labels(decision=result["decision"], confidence=result["confidence"]).inc()
 
     return InvestigationResponse(
         transaction_id=req.transaction_id,
@@ -235,3 +250,8 @@ def ab_results():
     challenger model (Transformer) is ready to replace the champion (LightGBM).
     """
     return ab_router.get_results()
+
+@app.get("/metrics")
+def prometheus_metrics():
+    """Prometheus scrape endpoint — exposes all operational metrics."""
+    return metrics_endpoint()
